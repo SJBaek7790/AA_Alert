@@ -4,15 +4,18 @@ Monthly Portfolio Allocation Calculator
 - HAA 한국형 (50%) + Defense First 한국형 (50%)
 - Sends allocation via Telegram with diffs from last month
 - Stores memory in allocation_history.json
-- Runs monthly via GitHub Actions
+- Runs on the day before the last business day of each month via GitHub Actions
 """
 
+import calendar
 import json
 import os
 import sys
+import time
 import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -22,12 +25,17 @@ import yfinance as yf
 warnings.filterwarnings("ignore")
 
 # ──────────────────────────────────────────────
-# Configuration
+# Constants
 # ──────────────────────────────────────────────
+
+KST = ZoneInfo("Asia/Seoul")
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 HISTORY_FILE = "allocation_history.json"
+
+# Maximum Telegram message length
+TELEGRAM_MAX_LENGTH = 4096
 
 # Friendly names for all tickers
 TICKER_NAMES = {
@@ -45,10 +53,62 @@ TICKER_NAMES = {
     "261220.KS": "KODEX WTI원유선물(H)",
     "0048J0.KS": "KODEX 미국머니마켓액티브",
     "0060H0.KS": "TIGER 토탈월드스탁액티브",
-    "TIP": "iShares TIPS Bond ETF",
-    "BIL": "SPDR Blmbg 1-3M T-Bill ETF",
+    "TIP": "TIP",
+    "BIL": "BIL",
     "UUP": "Invesco DB US Dollar Index",
 }
+
+
+# ──────────────────────────────────────────────
+# Retry wrapper
+# ──────────────────────────────────────────────
+
+def retry(fn, *, max_retries: int = 3, delay: float = 2.0, backoff: float = 2.0,
+          exceptions: tuple = (Exception,)):
+    """
+    Simple retry wrapper with exponential backoff.
+    Returns the result of fn() on success.
+    Raises the last exception if all retries are exhausted.
+    """
+    last_exc = None
+    current_delay = delay
+    for attempt in range(1, max_retries + 1):
+        try:
+            return fn()
+        except exceptions as e:
+            last_exc = e
+            if attempt < max_retries:
+                print(f"  ⟳ Attempt {attempt}/{max_retries} failed: {e}. "
+                      f"Retrying in {current_delay:.1f}s...")
+                time.sleep(current_delay)
+                current_delay *= backoff
+            else:
+                print(f"  ✗ All {max_retries} attempts failed: {e}")
+    raise last_exc
+
+
+# ──────────────────────────────────────────────
+# Date helpers
+# ──────────────────────────────────────────────
+
+def get_last_business_day(year: int, month: int) -> datetime:
+    """Return the last business day (Mon-Fri) of the given month."""
+    last_day = calendar.monthrange(year, month)[1]
+    dt = datetime(year, month, last_day)
+    while dt.weekday() >= 5:  # Sat=5, Sun=6
+        dt -= timedelta(days=1)
+    return dt
+
+
+def is_day_before_last_business_day(dt: datetime) -> bool:
+    """Check if `dt` is 1 business day before the last business day of its month."""
+    last_bd = get_last_business_day(dt.year, dt.month)
+    # Walk backwards from last_bd to find the previous business day
+    prev_bd = last_bd - timedelta(days=1)
+    while prev_bd.weekday() >= 5:
+        prev_bd -= timedelta(days=1)
+    return dt.date() == prev_bd.date()
+
 
 # ──────────────────────────────────────────────
 # Data fetching
@@ -57,7 +117,7 @@ TICKER_NAMES = {
 def fetch_prices(tickers: list[str], period: str = "15mo") -> pd.DataFrame:
     """
     Download adjusted close prices for all tickers.
-    Uses yfinance. Falls back to pykrx for .KS tickers that fail.
+    Uses yfinance with retry. Falls back to pykrx for .KS tickers that fail.
     """
     # We need at least 13 months of data for 12M return calculation
     end_date = datetime.today()
@@ -69,26 +129,37 @@ def fetch_prices(tickers: list[str], period: str = "15mo") -> pd.DataFrame:
     ks_tickers = [t for t in tickers if t.endswith(".KS")]
     us_tickers = [t for t in tickers if not t.endswith(".KS")]
 
-    # Download US tickers via yfinance (batch)
+    # Download US tickers via yfinance (batch) with retry
     if us_tickers:
         print(f"Downloading US tickers: {us_tickers}")
-        data = yf.download(us_tickers, start=start_date, end=end_date,
-                           auto_adjust=True, progress=False)
+
+        def _download_us():
+            return yf.download(us_tickers, start=start_date, end=end_date,
+                               auto_adjust=True, progress=False)
+
+        data = retry(_download_us, max_retries=3, delay=3.0)
+
         if len(us_tickers) == 1:
             all_prices[us_tickers[0]] = data["Close"]
         else:
+            close_df = data["Close"]
             for t in us_tickers:
-                if t in data["Close"].columns:
-                    series = data["Close"][t].dropna()
+                if t in close_df.columns:
+                    series = close_df[t].dropna()
                     if len(series) > 0:
                         all_prices[t] = series
 
     # Download KS tickers one by one (some newer tickers need individual handling)
     for t in ks_tickers:
         print(f"Downloading {t}...")
+
+        # Try yfinance with retry
         try:
-            df = yf.download(t, start=start_date, end=end_date,
-                             auto_adjust=True, progress=False)
+            def _download_ks(ticker=t):
+                return yf.download(ticker, start=start_date, end=end_date,
+                                   auto_adjust=True, progress=False)
+
+            df = retry(_download_ks, max_retries=3, delay=2.0)
             if df is not None and len(df) > 20:
                 all_prices[t] = df["Close"].squeeze()
                 print(f"  ✓ yfinance OK ({len(df)} rows)")
@@ -96,13 +167,17 @@ def fetch_prices(tickers: list[str], period: str = "15mo") -> pd.DataFrame:
         except Exception as e:
             print(f"  ✗ yfinance failed: {e}")
 
-        # Fallback: try pykrx for KRX-listed ETFs
+        # Fallback: try pykrx for KRX-listed ETFs with retry
         try:
             from pykrx import stock as krx_stock
             code = t.replace(".KS", "")
             start_str = start_date.strftime("%Y%m%d")
             end_str = end_date.strftime("%Y%m%d")
-            df_krx = krx_stock.get_market_ohlcv(start_str, end_str, code)
+
+            def _download_pykrx(c=code, s=start_str, e=end_str):
+                return krx_stock.get_market_ohlcv(s, e, c)
+
+            df_krx = retry(_download_pykrx, max_retries=3, delay=2.0)
             if df_krx is not None and len(df_krx) > 20:
                 all_prices[t] = df_krx["종가"]
                 all_prices[t].index = pd.to_datetime(all_prices[t].index)
@@ -125,16 +200,18 @@ def fetch_prices(tickers: list[str], period: str = "15mo") -> pd.DataFrame:
 def calc_return(prices: pd.Series, months: int) -> float:
     """Calculate return over N months from the last available price."""
     if prices.empty:
-        return -999.0
+        return np.nan
     end_price = prices.iloc[-1]
+    if np.isnan(end_price) or end_price <= 0:
+        return np.nan
     target_date = prices.index[-1] - pd.DateOffset(months=months)
     # Find closest date on or before target
     mask = prices.index <= target_date
     if mask.sum() == 0:
-        return -999.0
+        return np.nan
     start_price = prices.loc[mask].iloc[-1]
-    if start_price == 0:
-        return -999.0
+    if np.isnan(start_price) or start_price <= 0:
+        return np.nan
     return (end_price / start_price) - 1.0
 
 
@@ -144,9 +221,9 @@ def calc_momentum(prices: pd.Series) -> float:
     r3 = calc_return(prices, 3)
     r6 = calc_return(prices, 6)
     r12 = calc_return(prices, 12)
-    vals = [v for v in [r1, r3, r6, r12] if v > -900]
+    vals = [v for v in [r1, r3, r6, r12] if not np.isnan(v)]
     if not vals:
-        return -999.0
+        return np.nan
     return np.mean(vals)
 
 
@@ -230,8 +307,8 @@ def calc_defense_first_allocation(prices_df: pd.DataFrame) -> dict[str, float]:
 
     # Four defensive assets
     defensive_assets = ["476760.KS", "411060.KS", "261220.KS", "UUP"]
-    # Allocation tiers for ranks 1-4
-    tier_weights = [0.20, 0.15, 0.10, 0.05]  # × 50% of portfolio = 40%,30%,20%,10% of this sleeve
+    # Absolute portfolio weights (README: 40%/30%/20%/10% of the 50% Defense sleeve)
+    tier_weights = [0.20, 0.15, 0.10, 0.05]
 
     # Calculate momentum for each defensive asset
     mom_def = {}
@@ -296,13 +373,13 @@ def apply_further_rules(
     treasury_ticker = "308620.KS"
 
     if gold_ticker in final and final[gold_ticker] > 0:
-        r12_gold = calc_12m_return(prices_df[gold_ticker]) if gold_ticker in prices_df.columns else -999
-        r12_treas = calc_12m_return(prices_df[treasury_ticker]) if treasury_ticker in prices_df.columns else -999
+        r12_gold = calc_12m_return(prices_df[gold_ticker]) if gold_ticker in prices_df.columns else np.nan
+        r12_treas = calc_12m_return(prices_df[treasury_ticker]) if treasury_ticker in prices_df.columns else np.nan
 
         print(f"\n[Rule 3b] Gold 12M return: {r12_gold:.4f}, Treasury 12M return: {r12_treas:.4f}")
 
         if r12_gold > 0 and r12_treas > 0:
-            print(f"  Both positive → keep gold allocation")
+            print("  Both positive → keep gold allocation")
         else:
             gold_w = final.pop(gold_ticker)
             final["0048J0.KS"] = final.get("0048J0.KS", 0) + gold_w
@@ -339,6 +416,10 @@ def calculate_allocation() -> dict[str, float]:
     ]))
 
     prices_df = fetch_prices(all_tickers)
+
+    if prices_df.empty:
+        raise RuntimeError("No price data fetched. All downloads failed.")
+
     print(f"\nPrice data shape: {prices_df.shape}")
     print(f"Date range: {prices_df.index[0].date()} → {prices_df.index[-1].date()}")
     print(f"Tickers fetched: {list(prices_df.columns)}")
@@ -347,6 +428,11 @@ def calculate_allocation() -> dict[str, float]:
     missing = [t for t in all_tickers if t not in prices_df.columns]
     if missing:
         print(f"\n⚠ WARNING: Missing data for: {missing}")
+        # If critical tickers are missing, abort
+        critical = {"TIP", "BIL"}
+        missing_critical = critical & set(missing)
+        if missing_critical:
+            raise RuntimeError(f"Missing critical benchmark tickers: {missing_critical}")
 
     # Step 1: HAA 한국형 (50%)
     print("\n" + "=" * 60)
@@ -380,7 +466,7 @@ def calculate_allocation() -> dict[str, float]:
     total = sum(final.values())
     print(f"\nFinal total weight: {total:.2%}")
     if abs(total - 1.0) > 0.01:
-        print(f"⚠ Total weight is {total:.4f}, expected 1.0")
+        raise RuntimeError(f"Total weight is {total:.4f}, expected 1.0")
 
     return final
 
@@ -410,7 +496,8 @@ def get_last_month_weights(history: dict) -> dict[str, float] | None:
 
 
 def add_record(history: dict, weights: dict[str, float]) -> dict:
-    today_str = datetime.today().strftime("%Y-%m-%d")
+    now = datetime.now(KST)
+    today_str = now.strftime("%Y-%m-%d")
     record = {
         "date": today_str,
         "weights": {k: round(v, 4) for k, v in weights.items()},
@@ -423,30 +510,91 @@ def add_record(history: dict, weights: dict[str, float]) -> dict:
 # Telegram
 # ──────────────────────────────────────────────
 
-def send_telegram_message(text: str):
+def _send_telegram_raw(text: str, parse_mode: str = "HTML"):
+    """Low-level Telegram send with retry and chunking."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("\n⚠ Telegram credentials not set. Message:")
         print(text)
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-    }
-    resp = requests.post(url, json=payload, timeout=30)
-    if resp.status_code == 200:
-        print("✓ Telegram message sent successfully.")
+    # Split into chunks if message exceeds Telegram limit
+    chunks = []
+    if len(text) <= TELEGRAM_MAX_LENGTH:
+        chunks = [text]
     else:
-        print(f"✗ Telegram error {resp.status_code}: {resp.text}")
+        lines = text.split("\n")
+        current_chunk = ""
+        for line in lines:
+            if len(current_chunk) + len(line) + 1 > TELEGRAM_MAX_LENGTH:
+                chunks.append(current_chunk)
+                current_chunk = line
+            else:
+                current_chunk += ("\n" if current_chunk else "") + line
+        if current_chunk:
+            chunks.append(current_chunk)
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    for i, chunk in enumerate(chunks, 1):
+        def _send(c=chunk):
+            resp = requests.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": c,
+                "parse_mode": parse_mode,
+            }, timeout=30)
+            resp.raise_for_status()
+            return resp
+
+        try:
+            retry(_send, max_retries=3, delay=2.0,
+                  exceptions=(requests.RequestException,))
+            print(f"✓ Telegram message {i}/{len(chunks)} sent successfully.")
+        except Exception as e:
+            print(f"✗ Telegram error for chunk {i}/{len(chunks)}: {e}")
+
+
+def send_telegram_message(text: str):
+    """Send an HTML-formatted Telegram message."""
+    _send_telegram_raw(text, parse_mode="HTML")
+
+
+def send_error_telegram(error: Exception, tb_str: str):
+    """
+    Send error details to Telegram as a JSON code block.
+    Truncates traceback if needed to stay within character limits.
+    """
+    now = datetime.now(KST)
+    error_data = {
+        "status": "FAILED",
+        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S KST"),
+        "error_type": type(error).__name__,
+        "message": str(error),
+        "traceback": tb_str,
+    }
+
+    # Build the message
+    header = "🚨 <b>Portfolio Allocation FAILED</b>\n\n"
+    error_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+    code_block = f"<pre>{error_json}</pre>"
+    full_msg = header + code_block
+
+    # If too long, truncate traceback to fit
+    if len(full_msg) > TELEGRAM_MAX_LENGTH:
+        max_tb_len = TELEGRAM_MAX_LENGTH - len(header) - 200  # reserve space for JSON structure
+        error_data["traceback"] = tb_str[:max_tb_len] + "\n... (truncated)"
+        error_json = json.dumps(error_data, indent=2, ensure_ascii=False)
+        code_block = f"<pre>{error_json}</pre>"
+        full_msg = header + code_block
+
+    _send_telegram_raw(full_msg, parse_mode="HTML")
 
 
 def format_message(
     weights: dict[str, float],
     prev_weights: dict[str, float] | None,
 ) -> str:
-    today_str = datetime.today().strftime("%Y-%m-%d")
+    now = datetime.now(KST)
+    today_str = now.strftime("%Y-%m-%d")
     lines = []
     lines.append(f"<b>📊 Monthly Allocation Report</b>")
     lines.append(f"<b>Date: {today_str}</b>")
@@ -519,16 +667,31 @@ def format_message(
 # ──────────────────────────────────────────────
 
 def main():
+    now = datetime.now(KST)
+
     print("=" * 60)
     print("Monthly Portfolio Allocation Calculator")
-    print(f"Run date: {datetime.today().strftime('%Y-%m-%d %H:%M')}")
+    print(f"Run date (KST): {now.strftime('%Y-%m-%d %H:%M')}")
     print("=" * 60)
+
+    # ── Idempotency: skip if already ran this month ──
+    history = load_history()
+    current_month = now.strftime("%Y-%m")
+    records = history.get("records", [])
+    if records and records[-1]["date"].startswith(current_month):
+        print(f"Already ran for {current_month} (last record: {records[-1]['date']}). Skipping.")
+        return
+
+    # ── Date guard: only run on the day before the last business day ──
+    if not is_day_before_last_business_day(now):
+        print(f"Today ({now.strftime('%Y-%m-%d')}) is not the day before "
+              f"the last business day of the month. Skipping.")
+        return
 
     # Calculate allocation
     weights = calculate_allocation()
 
-    # Load history & get previous weights
-    history = load_history()
+    # Get previous weights (history already loaded above)
     prev_weights = get_last_month_weights(history)
 
     # Format & send message
@@ -546,4 +709,18 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        import traceback
+        tb_str = traceback.format_exc()
+        print(f"\nFATAL ERROR: {e}", file=sys.stderr)
+        print(tb_str, file=sys.stderr)
+        # Send error notification via Telegram
+        try:
+            send_error_telegram(e, tb_str)
+        except Exception as tg_err:
+            print(f"Could not send error to Telegram: {tg_err}", file=sys.stderr)
+        sys.exit(1)
