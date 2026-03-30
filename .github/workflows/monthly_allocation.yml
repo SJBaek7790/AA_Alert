@@ -4,7 +4,7 @@ on:
   schedule:
     # Run on 25th-31st of each month at 18:00 KST (09:00 UTC)
     # The script itself checks if today is the day before the last business day
-    - cron: '0 9 25-31 * *'
+    - cron: '0 1 26-31 * *'
   workflow_dispatch:  # Allow manual trigger
 
 permissions:
@@ -36,7 +36,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase
           git add allocation_history.json
           git diff --staged --quiet || git commit -m "Update allocation history $(date +%Y-%m-%d)"
+          git pull --rebase
           git push
