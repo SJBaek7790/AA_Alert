@@ -25,7 +25,7 @@ Automated monthly portfolio allocation calculator combining **HAA 한국형 (50%
   - 251350.KS (KODEX 선진국 MSCI World)
   - 476760.KS (ACE 미국30년국채액티브)
   - 308620.KS (KODEX 미국10년국채선물)
-  - 276000.KS (TIGER 글로벌자원생산기업(합성 H))
+  - PDBC (Invesco Optimum Yield Diversified Commodity)
   - 182480.KS (TIGER 미국MSCI리츠(합성H))
 
 ### 1-2. Risk Off (TIP < BIL)
@@ -42,7 +42,7 @@ Automated monthly portfolio allocation calculator combining **HAA 한국형 (50%
 - Measure the momentum of 4 defensive assets:
   - 476760.KS (ACE 미국30년국채액티브)
   - 411060.KS (ACE KRX금현물)
-  - 261220.KS (KODEX WTI원유선물(H))
+  - PDBC (Invesco Optimum Yield Diversified Commodity)
   - UUP (Invesco DB US Dollar Index)
 - Rank the four defensive assets from highest to lowest momentum
 - Allocate within the 50% sleeve: **40%** (rank 1), **30%** (rank 2), **20%** (rank 3), **10%** (rank 4)
@@ -62,6 +62,7 @@ After calculating weights from #1 and #2:
    - 411060.KS (ACE KRX금현물) and 308620.KS (KODEX 미국10년국채선물)
    - If **both** 12M returns are positive → keep gold allocation
    - Otherwise → move gold portion to 0048J0.KS (KODEX 미국머니마켓액티브)
+3. **PDBC allocation**: Allocate any PDBC portion equally into 261220.KS (KODEX WTI원유선물(H)), 276000.KS (TIGER 글로벌자원생산기업(합성 H)), and 137610.KS (TIGER 농산물선물Enhanced(H)).
 
 ---
 

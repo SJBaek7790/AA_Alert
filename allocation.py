@@ -51,8 +51,10 @@ TICKER_NAMES = {
     "182480.KS": "TIGER 미국MSCI리츠(합성H)",
     "411060.KS": "ACE KRX금현물",
     "261220.KS": "KODEX WTI원유선물(H)",
+    "137610.KS": "TIGER 농산물선물Enhanced(H)",
     "0048J0.KS": "KODEX 미국머니마켓액티브",
     "0060H0.KS": "TIGER 토탈월드스탁액티브",
+    "PDBC": "Invesco Optimum Yield Diversified Commodity",
     "TIP": "TIP",
     "BIL": "BIL",
     "UUP": "Invesco DB US Dollar Index",
@@ -260,7 +262,7 @@ def calc_haa_allocation(prices_df: pd.DataFrame) -> dict[str, float]:
         # Offensive pool: pick top 4 by momentum, each 5%
         offensive_pool = [
             "360200.KS", "489250.KS", "280930.KS", "195980.KS",
-            "251350.KS", "476760.KS", "308620.KS", "276000.KS", "182480.KS",
+            "251350.KS", "476760.KS", "308620.KS", "PDBC", "182480.KS",
         ]
         mom_scores = {}
         for t in offensive_pool:
@@ -306,7 +308,7 @@ def calc_defense_first_allocation(prices_df: pd.DataFrame) -> dict[str, float]:
     mom_bil = calc_momentum(prices_df["BIL"])
 
     # Four defensive assets
-    defensive_assets = ["476760.KS", "411060.KS", "261220.KS", "UUP"]
+    defensive_assets = ["476760.KS", "411060.KS", "PDBC", "UUP"]
     # Absolute portfolio weights (README: 40%/30%/20%/10% of the 50% Defense sleeve)
     tier_weights = [0.20, 0.15, 0.10, 0.05]
 
@@ -385,6 +387,15 @@ def apply_further_rules(
             final["0048J0.KS"] = final.get("0048J0.KS", 0) + gold_w
             print(f"  Not both positive → Gold ({gold_w:.2%}) → 0048J0.KS")
 
+    # Rule 3c: PDBC split
+    if "PDBC" in final and final["PDBC"] > 0:
+        pdbc_w = final.pop("PDBC")
+        pdbc_split = pdbc_w / 3.0
+        final["261220.KS"] = final.get("261220.KS", 0) + pdbc_split
+        final["276000.KS"] = final.get("276000.KS", 0) + pdbc_split
+        final["137610.KS"] = final.get("137610.KS", 0) + pdbc_split
+        print(f"\n[Rule 3c] PDBC ({pdbc_w:.2%}) → 261220.KS, 276000.KS, 137610.KS equally ({pdbc_split:.2%} each)")
+
     # Remove zero-weight entries
     final = {k: v for k, v in final.items() if v > 1e-9}
 
@@ -404,13 +415,15 @@ def calculate_allocation() -> dict[str, float]:
         "418660.KS", "308620.KS",
         # HAA offensive pool
         "360200.KS", "489250.KS", "280930.KS", "195980.KS",
-        "251350.KS", "476760.KS", "276000.KS", "182480.KS",
+        "251350.KS", "476760.KS", "PDBC", "182480.KS",
         # HAA risk-off
         "0048J0.KS",
         # Defense First defensive
-        "411060.KS", "261220.KS", "UUP",
+        "411060.KS", "PDBC", "UUP",
         # Defense First replacement
         "0060H0.KS",
+        # PDBC split targets
+        "261220.KS", "137610.KS", "276000.KS",
         # Momentum benchmarks
         "TIP", "BIL",
     ]))
