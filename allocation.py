@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
+from workalendar.asia import SouthKorea
 
 warnings.filterwarnings("ignore")
 
@@ -94,20 +95,22 @@ def retry(fn, *, max_retries: int = 3, delay: float = 2.0, backoff: float = 2.0,
 # ──────────────────────────────────────────────
 
 def get_last_business_day(year: int, month: int) -> datetime:
-    """Return the last business day (Mon-Fri) of the given month."""
+    """Return the last business day (Mon-Fri, non-holiday) of the given month."""
+    cal = SouthKorea()
     last_day = calendar.monthrange(year, month)[1]
     dt = datetime(year, month, last_day)
-    while dt.weekday() >= 5:  # Sat=5, Sun=6
+    while not cal.is_working_day(dt):
         dt -= timedelta(days=1)
     return dt
 
 
 def is_day_before_last_business_day(dt: datetime) -> bool:
     """Check if `dt` is 1 business day before the last business day of its month."""
+    cal = SouthKorea()
     last_bd = get_last_business_day(dt.year, dt.month)
     # Walk backwards from last_bd to find the previous business day
     prev_bd = last_bd - timedelta(days=1)
-    while prev_bd.weekday() >= 5:
+    while not cal.is_working_day(prev_bd):
         prev_bd -= timedelta(days=1)
     return dt.date() == prev_bd.date()
 
@@ -191,7 +194,24 @@ def fetch_prices(tickers: list[str], period: str = "15mo") -> pd.DataFrame:
         print(f"  ⚠ Could not fetch data for {t}")
 
     prices_df = pd.DataFrame(all_prices)
-    prices_df = prices_df.sort_index().ffill()
+    # Cap ffill to prevent silently dragging stale data for weeks
+    prices_df = prices_df.sort_index().ffill(limit=5)
+
+    if not prices_df.empty:
+        # Freshness check: verify the latest index is recent
+        last_date = prices_df.index[-1]
+        
+        # Determine days difference (handle timezone safely)
+        now_naive = pd.Timestamp.today().tz_localize(None)
+        last_date_naive = last_date.tz_localize(None)
+        
+        days_diff = (now_naive - last_date_naive).days
+        if days_diff > 5:
+            raise RuntimeError(
+                f"Data freshness check failed! Latest prices are from {last_date.date()} "
+                f"({days_diff} days old). Check for delistings, suspensions, or data provider failures."
+            )
+
     return prices_df
 
 
